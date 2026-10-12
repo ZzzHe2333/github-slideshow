@@ -114,9 +114,23 @@ mod app {
         }
         s
     }
+    fn decode_process(bytes: &[u8]) -> String {
+        // PowerShell may emit UTF-16LE, UTF-8 or the local Windows OEM code page.
+        if bytes.len()>=2 && bytes[0]==0xff && bytes[1]==0xfe {
+            let wide: Vec<u16> = bytes[2..].chunks_exact(2).map(|v|u16::from_le_bytes([v[0],v[1]])).collect();
+            return String::from_utf16_lossy(&wide);
+        }
+        if bytes.len()>=4 && bytes[1]==0 && bytes[3]==0 {
+            let wide: Vec<u16> = bytes.chunks_exact(2).map(|v|u16::from_le_bytes([v[0],v[1]])).collect();
+            return String::from_utf16_lossy(&wide);
+        }
+        String::from_utf8_lossy(bytes).to_string()
+    }
     fn invoke(action: &str, idx: u32) -> Result<Vec<String>,String> {
         if action!="list" && action!="switch" {return Err("操作不受支持".into());}
-        let script=format!("{}\ntry {{ Invoke-WiredSwitch -Action '{}' -Index {} }} catch {{ Write-Output ('ERROR|' + [Uri]::EscapeDataString($_.Exception.Message)); exit 2 }}\n",
+        // Force output to UTF-8, so both details and PowerShell errors can be shown.
+        let script=format!(
+            "$ErrorActionPreference='Stop';[Console]::OutputEncoding=New-Object System.Text.UTF8Encoding($false);\n{}\ntry {{ Invoke-WiredSwitch -Action '{}' -Index {} }} catch {{ Write-Output ('ERROR|' + [Uri]::EscapeDataString($_.Exception.ToString())); exit 2 }}\n",
             include_str!("network.ps1"),action,idx);
         let mut encoded=Vec::new();
         for c in script.encode_utf16() {encoded.extend_from_slice(&c.to_le_bytes());}
@@ -124,11 +138,17 @@ mod app {
             .args(["-NoLogo","-NoProfile","-NonInteractive","-ExecutionPolicy","Bypass",
                 "-EncodedCommand",&base64(&encoded)])
             .creation_flags(CREATE_NO_WINDOW).output()
-            .map_err(|e|format!("无法执行 PowerShell: {e}"))?;
-        let lines:Vec<String>=String::from_utf8_lossy(&result.stdout)
-            .lines().map(|x|x.trim().to_string()).filter(|x|!x.is_empty()).collect();
+            .map_err(|e|format!("无法启动 Windows PowerShell：{e}"))?;
+        let stdout=decode_process(&result.stdout);
+        let stderr=decode_process(&result.stderr);
+        let lines:Vec<String>=stdout.lines().map(|x|x.trim().trim_start_matches('\u{feff}').to_string())
+            .filter(|x|!x.is_empty()).collect();
         if let Some(msg)=lines.iter().find(|x|x.starts_with("ERROR|")) {return Err(dec(&msg[6..]));}
-        if !result.status.success() {return Err(format!("系统脚本失败，代码 {:?}，请检查管理员权限和网络管理组件。",result.status.code()));}
+        if !result.status.success() {
+            let detail=if !stderr.trim().is_empty(){stderr.trim()}else if !stdout.trim().is_empty(){stdout.trim()}else{"PowerShell 未提供错误详情"};
+            return Err(format!("PowerShell 执行失败（退出代码 {:?}）。\n{}",
+                result.status.code(),detail.chars().take(1300).collect::<String>()));
+        }
         Ok(lines)
     }
 
@@ -252,6 +272,16 @@ mod app {
         }
     }
     pub fn run() {
+        // Read-only diagnostic entrypoint, used by the Windows CI smoke test.
+        // No UAC or network modifications; file output allows GUI subsystem testing.
+        if let Some(path)=std::env::args().find_map(|v|v.strip_prefix("--diagnose-file=").map(str::to_string)) {
+            let message=match invoke("list",0) {
+                Ok(lines)=>format!("OK\n{}\n",lines.join("\n")),
+                Err(e)=>format!("ERROR\n{}\n",e)
+            };
+            let _=std::fs::write(path,message);
+            return;
+        }
         unsafe {
             if IsUserAnAdmin()==0 {
                 if let Ok(path)=std::env::current_exe() {
