@@ -8,7 +8,7 @@ permissions:
   contents: read
 jobs:
   windows-exe:
-    runs-on: windows-latest
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
       - name: Validate PowerShell 5.1 syntax
@@ -42,6 +42,7 @@ jobs:
           $result = Get-Content $resultFile -Raw -Encoding UTF8
           Write-Host $result
           if (-not $result.StartsWith("OK")) { throw "Rust PowerShell discovery smoke test failed" }
+          if ($result -notmatch '(?m)^ADAPTER\|') { throw "No Ethernet adapter data returned by compiled EXE" }
       - name: Stage EXE
         shell: pwsh
         run: |
