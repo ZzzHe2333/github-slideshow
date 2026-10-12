@@ -32,6 +32,16 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "PowerShell discovery failed: $LASTEXITCODE" }
       - name: Build EXE
         run: cargo build --release --manifest-path ip-switcher/Cargo.toml
+      - name: Smoke test actual compiled EXE without modifying any IP
+        shell: pwsh
+        run: |
+          $resultFile = Join-Path $env:RUNNER_TEMP 'wired-ip-readonly-diagnostic.txt'
+          $exe = Join-Path $PWD 'ip-switcher/target/release/wired-ip-switcher.exe'
+          $p = Start-Process -FilePath $exe -ArgumentList "--diagnose-file=$resultFile" -PassThru -Wait
+          if (-not (Test-Path $resultFile)) { throw "Diagnostic did not produce a result file. Exit $($p.ExitCode)" }
+          $result = Get-Content $resultFile -Raw -Encoding UTF8
+          Write-Host $result
+          if (-not $result.StartsWith("OK")) { throw "Rust PowerShell discovery smoke test failed" }
       - name: Stage EXE
         shell: pwsh
         run: |
