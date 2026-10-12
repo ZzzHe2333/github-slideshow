@@ -70,8 +70,8 @@ function Invoke-WiredSwitch([string]$Action, [uint32]$Index) {
   if ([math]::Floor((AsNum $old)/$subnetSize) -ne [math]::Floor((AsNum $target)/$subnetSize)) {
     throw '新旧地址不在同一子网。'
   }
-  $host = (AsNum $target) % $subnetSize
-  if ($host -eq 0 -or $host -eq ($subnetSize-1)) { throw '目标是网络地址或广播地址。' }
+  $hostPart = (AsNum $target) % $subnetSize
+  if ($hostPart -eq 0 -or $hostPart -eq ($subnetSize-1)) { throw '目标是网络地址或广播地址。' }
   $inUse = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop | Where-Object { $_.IPAddress -eq $target })
   if ($inUse.Count -gt 0) { throw '目标 IP 已被本机使用。' }
   if (Test-Connection -ComputerName $target -Count 1 -Quiet -ErrorAction SilentlyContinue) {
