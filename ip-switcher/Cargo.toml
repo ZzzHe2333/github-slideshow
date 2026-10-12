@@ -1,0 +1,13 @@
+[package]
+name = "wired-ip-switcher"
+version = "1.0.1"
+edition = "2021"
+
+[dependencies]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
