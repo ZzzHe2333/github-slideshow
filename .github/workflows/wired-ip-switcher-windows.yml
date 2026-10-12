@@ -11,6 +11,25 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Validate PowerShell 5.1 syntax
+        shell: pwsh
+        run: |
+          $path = Join-Path $PWD 'ip-switcher/src/network.ps1'
+          $tokens = $null; $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Host "SYNTAX ERROR: $($_.Message) line $($_.Extent.StartLineNumber)" }
+            throw 'PowerShell syntax check failed'
+          }
+          Write-Host 'PowerShell syntax passed'
+      - name: Exercise read-only adapter discovery with Windows PowerShell 5.1
+        shell: pwsh
+        run: |
+          $src = Get-Content 'ip-switcher/src/network.ps1' -Raw -Encoding utf8
+          $code = "$src`nInvoke-WiredSwitch -Action 'list' -Index 0"
+          $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($code))
+          & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encoded
+          if ($LASTEXITCODE -ne 0) { throw "PowerShell discovery failed: $LASTEXITCODE" }
       - name: Build EXE
         run: cargo build --release --manifest-path ip-switcher/Cargo.toml
       - name: Stage EXE
