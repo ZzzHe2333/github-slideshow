@@ -7,10 +7,8 @@ fn main() { eprintln!("Windows 10/11 only."); }
 mod app {
     use std::ffi::{c_void, OsStr};
     use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::process::CommandExt;
     use std::ptr::{null, null_mut};
     use std::mem::zeroed;
-    use std::process::Command;
 
     type H = *mut c_void;
     const WS_OVERLAPPEDWINDOW: u32 = 0x00CF0000;
@@ -31,7 +29,11 @@ mod app {
     const MB_ICONERROR: u32 = 0x10;
     const MB_ICONINFO: u32 = 0x40;
     const SW_SHOW: i32 = 5;
-    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    const CREATE_NEW_CONSOLE: u32 = 0x00000010;
+    const CREATE_UNICODE_ENVIRONMENT: u32 = 0x00000400;
+    const STARTF_USESHOWWINDOW: u32 = 0x00000001;
+    const WAIT_FAILED: u32 = 0xffffffff;
+    const WAIT_OBJECT_0: u32 = 0;
     const ID_COMBO: usize = 1001;
     const ID_REFRESH: usize = 1002;
     const ID_SWITCH: usize = 1003;
@@ -48,6 +50,14 @@ mod app {
         cursor: H, background: H, menu: *const u16, name: *const u16,
     }
 
+    // Win32 STARTUPINFOW/PROCESS_INFORMATION; this path does not inherit GUI std handles.
+    #[repr(C)] struct StartupInfoW {
+        cb:u32, reserved:*mut u16, desktop:*mut u16, title:*mut u16,
+        x:u32, y:u32, width:u32, height:u32, chars_x:u32, chars_y:u32,
+        fill:u32, flags:u32, show:u16, reserved2_len:u16, reserved2:*mut u8,
+        stdin:H, stdout:H, stderr:H,
+    }
+    #[repr(C)] struct ProcessInfo { process:H, thread:H, pid:u32, tid:u32 }
     #[link(name = "user32")]
     extern "system" {
         fn RegisterClassW(class: *const WndClass) -> u16;
@@ -67,7 +77,18 @@ mod app {
         fn EnableWindow(hwnd: H, enabled: i32) -> i32;
     }
     #[link(name = "kernel32")]
-    extern "system" { fn GetModuleHandleW(module: *const u16) -> H; }
+    extern "system" {
+        fn GetModuleHandleW(module: *const u16) -> H;
+        fn CreateProcessW(app: *const u16, command: *mut u16,
+            proc_attr:*mut c_void, thread_attr:*mut c_void, inherit:i32,
+            flags:u32, environment:*mut c_void, dir:*const u16,
+            startup:*mut StartupInfoW, process:*mut ProcessInfo) -> i32;
+        fn WaitForSingleObject(handle:H, milliseconds:u32) -> u32;
+        fn GetExitCodeProcess(handle:H, code:*mut u32) -> i32;
+        fn CloseHandle(handle:H) -> i32;
+        fn GetLastError() -> u32;
+        fn FreeConsole() -> i32;
+    }
     #[link(name = "shell32")]
     extern "system" {
         fn IsUserAnAdmin() -> i32;
@@ -114,42 +135,77 @@ mod app {
         }
         s
     }
-    fn decode_process(bytes: &[u8]) -> String {
-        // PowerShell may emit UTF-16LE, UTF-8 or the local Windows OEM code page.
-        if bytes.len()>=2 && bytes[0]==0xff && bytes[1]==0xfe {
-            let wide: Vec<u16> = bytes[2..].chunks_exact(2).map(|v|u16::from_le_bytes([v[0],v[1]])).collect();
-            return String::from_utf16_lossy(&wide);
-        }
-        if bytes.len()>=4 && bytes[1]==0 && bytes[3]==0 {
-            let wide: Vec<u16> = bytes.chunks_exact(2).map(|v|u16::from_le_bytes([v[0],v[1]])).collect();
-            return String::from_utf16_lossy(&wide);
-        }
-        String::from_utf8_lossy(bytes).to_string()
-    }
     fn invoke(action: &str, idx: u32) -> Result<Vec<String>,String> {
         if action!="list" && action!="switch" {return Err("操作不受支持".into());}
-        // Force output to UTF-8, so both details and PowerShell errors can be shown.
-        let script=format!(
-            "$ErrorActionPreference='Stop';[Console]::OutputEncoding=New-Object System.Text.UTF8Encoding($false);\n{}\ntry {{ Invoke-WiredSwitch -Action '{}' -Index {} }} catch {{ Write-Output ('ERROR|' + [Uri]::EscapeDataString($_.Exception.ToString())); exit 2 }}\n",
-            include_str!("network.ps1"),action,idx);
-        let mut encoded=Vec::new();
-        for c in script.encode_utf16() {encoded.extend_from_slice(&c.to_le_bytes());}
-        let result=Command::new("powershell.exe")
-            .args(["-NoLogo","-NoProfile","-NonInteractive","-ExecutionPolicy","Bypass",
-                "-EncodedCommand",&base64(&encoded)])
-            .creation_flags(CREATE_NO_WINDOW).output()
-            .map_err(|e|format!("无法启动 Windows PowerShell：{e}"))?;
-        let stdout=decode_process(&result.stdout);
-        let stderr=decode_process(&result.stderr);
-        let lines:Vec<String>=stdout.lines().map(|x|x.trim().trim_start_matches('\u{feff}').to_string())
-            .filter(|x|!x.is_empty()).collect();
-        if let Some(msg)=lines.iter().find(|x|x.starts_with("ERROR|")) {return Err(dec(&msg[6..]));}
-        if !result.status.success() {
-            let detail=if !stderr.trim().is_empty(){stderr.trim()}else if !stdout.trim().is_empty(){stdout.trim()}else{"PowerShell 未提供错误详情"};
-            return Err(format!("PowerShell 执行失败（退出代码 {:?}）。\n{}",
-                result.status.code(),detail.chars().take(1300).collect::<String>()));
-        }
-        Ok(lines)
+        let nonce=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e|e.to_string())?.as_nanos();
+        let work=std::env::temp_dir().join(format!("WiredIPSwitcher-{}-{nonce}",std::process::id()));
+        std::fs::create_dir(&work).map_err(|e|format!("无法建立临时目录：{e}"))?;
+        let result=(|| -> Result<Vec<String>,String> {
+            let script_file=work.join("command.ps1");
+            let result_file=work.join("result.txt");
+            // Paths are generated internally; doubling apostrophes is PowerShell quoting.
+            let target=result_file.to_string_lossy().replace('\'',"''");
+            let body=format!(
+                "{}\n\
+                 try {{\n\
+                   $answer = @(Invoke-WiredSwitch -Action '{}' -Index {})\n\
+                   $answer | Out-File -LiteralPath '{}' -Encoding UTF8\n\
+                   exit 0\n\
+                 }} catch {{\n\
+                   $reason = 'ERROR|' + [Uri]::EscapeDataString($_.Exception.ToString())\n\
+                   $reason | Out-File -LiteralPath '{}' -Encoding UTF8\n\
+                   exit 2\n\
+                 }}\n",
+                include_str!("network.ps1"),action,idx,target,target);
+            // Windows PowerShell 5.1 reads BOM-marked UTF-8 scripts correctly.
+            let mut bytes=vec![0xef,0xbb,0xbf];
+            bytes.extend_from_slice(body.as_bytes());
+            std::fs::write(&script_file,bytes).map_err(|e|format!("无法写入临时脚本：{e}"))?;
+            let win=std::env::var_os("SystemRoot").or_else(||std::env::var_os("WINDIR"))
+                .unwrap_or_else(||std::ffi::OsString::from(r"C:\Windows"));
+            let ps=std::path::PathBuf::from(win)
+                .join("System32").join("WindowsPowerShell").join("v1.0").join("powershell.exe");
+            let app:Vec<u16>=ps.as_os_str().encode_wide().chain(Some(0)).collect();
+            let command=format!("\"{}\" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"{}\"",
+                ps.display(),script_file.display());
+            let mut args=w(&command);
+            unsafe {
+                let mut startup:StartupInfoW=zeroed();
+                let mut proc_info:ProcessInfo=zeroed();
+                startup.cb=std::mem::size_of::<StartupInfoW>() as u32;
+                startup.flags=STARTF_USESHOWWINDOW;
+                startup.show=0; // SW_HIDE: dedicated child console is never shown.
+                if CreateProcessW(app.as_ptr(),args.as_mut_ptr(),null_mut(),null_mut(),0,
+                    CREATE_NEW_CONSOLE|CREATE_UNICODE_ENVIRONMENT,
+                    null_mut(),null(),&mut startup,&mut proc_info)==0 {
+                    return Err(format!("启动 PowerShell 失败：Windows 错误 {}",GetLastError()));
+                }
+                let wait=WaitForSingleObject(proc_info.process,60000);
+                let mut code=0u32;
+                let got=GetExitCodeProcess(proc_info.process,&mut code);
+                CloseHandle(proc_info.thread);
+                CloseHandle(proc_info.process);
+                if wait!=WAIT_OBJECT_0 {
+                    return Err(format!("PowerShell 未能在 60 秒内结束（等待结果 0x{wait:08X}）。"));
+                }
+                if got==0 {return Err("无法读取 PowerShell 退出状态。".into());}
+                let data=std::fs::read_to_string(&result_file)
+                    .map_err(|e|format!("PowerShell 退出代码 {}，但未生成结果文件：{e}",code as i32))?;
+                let lines:Vec<String>=data.lines()
+                    .map(|x|x.trim().trim_start_matches('\u{feff}').to_string())
+                    .filter(|x|!x.is_empty()).collect();
+                if let Some(msg)=lines.iter().find(|x|x.starts_with("ERROR|")){
+                    return Err(dec(&msg[6..]));
+                }
+                if code!=0 {
+                    return Err(format!("PowerShell 退出代码 {}；\n{}",code as i32,lines.join("\n")));
+                }
+                Ok(lines)
+            }
+        })();
+        let _=std::fs::remove_dir_all(&work);
+        result
     }
 
     #[derive(Clone)]
@@ -275,6 +331,7 @@ mod app {
         // Read-only diagnostic entrypoint, used by the Windows CI smoke test.
         // No UAC or network modifications; file output allows GUI subsystem testing.
         if let Some(path)=std::env::args().find_map(|v|v.strip_prefix("--diagnose-file=").map(str::to_string)) {
+            unsafe { FreeConsole(); } // Force no attached console, as when launched from Explorer.
             let message=match invoke("list",0) {
                 Ok(lines)=>format!("OK\n{}\n",lines.join("\n")),
                 Err(e)=>format!("ERROR\n{}\n",e)
