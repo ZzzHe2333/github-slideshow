@@ -1,0 +1,26 @@
+name: Build Wired IP Switcher (Windows)
+on:
+  push:
+    branches:
+      - build/wired-ip-switcher-20261012
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows-exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build EXE
+        run: cargo build --release --manifest-path ip-switcher/Cargo.toml
+      - name: Stage EXE
+        shell: pwsh
+        run: |
+          New-Item -Type Directory -Force dist | Out-Null
+          Copy-Item ip-switcher/target/release/wired-ip-switcher.exe dist/Wired-IP-Switcher.exe
+          Get-FileHash dist/Wired-IP-Switcher.exe -Algorithm SHA256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Wired-IP-Switcher-Windows-x64
+          path: dist/Wired-IP-Switcher.exe
+          if-no-files-found: error
